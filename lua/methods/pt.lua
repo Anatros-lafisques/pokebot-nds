@@ -128,6 +128,19 @@ function update_pointers()
     -------------------------------------------------------------------------
     local tid_anchor = find_save_anchor_from_runtime_tid(anchor) or 0
 
+    -- Platinum general save block starts at anchor+0x14
+    -- (party data is anchor+0xB4, save party offset is 0xA0).
+    -- Roamer4 slots are 0x14 bytes at save offset 0x7FF4:
+    -- 0 Mesprit, 1 Cresselia, 2 unused, 3 Moltres, 4 Zapdos, 5 Articuno.
+    local roamer_slots = nil
+    if anchor > 0x02000000 then
+        local roamer_base = (anchor + 0x14) + 0x7FF4
+        roamer_slots = {}
+        for i = 0, 5 do
+            roamer_slots[i + 1] = roamer_base + (i * 0x14)
+        end
+    end
+
     -------------------------------------------------------------------------
     -- Pointer table (Platinum)
     -------------------------------------------------------------------------
@@ -174,6 +187,7 @@ function update_pointers()
         trainer_id   = anchor + 0x8C,
 
         roamer = mdword(anchor + 0x28364),
+        roamer_slots = roamer_slots,
 
         ---------------------------------------------------------------------
         -- Platinum save-block pockets (auto-anchored)

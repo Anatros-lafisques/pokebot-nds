@@ -82,6 +82,20 @@ function update_pointers()
 	else
 		fishing_exclamation_popup = 0x022A1AAF
 	end
+
+    -- Diamond/Pearl general save block sits 0x86 bytes before this anchor
+    -- (party data is anchor+0x12, save party offset is 0x98).
+    -- Roamers are the 0x14-byte Roamer4 structs at save offset 0x73A0:
+    -- slot 0 Mesprit, slot 1 Cresselia, slot 2 unused.
+    local roamer_slots = nil
+    if anchor > 0x02000000 then
+        local roamer_base = (anchor - 0x86) + 0x73A0
+        roamer_slots = {
+            roamer_base,
+            roamer_base + 0x14,
+            roamer_base + 0x28,
+        }
+    end
 	
     pointers = {
         start_value = 0x21066D4, -- 0 until save has been loaded
@@ -130,6 +144,7 @@ function update_pointers()
         save_indicator = 0x21C491F + _ROM.offset,
         
         roamer = roamer_anchor + 0x20,
+        roamer_slots = roamer_slots,
     }
 end
 
@@ -534,14 +549,357 @@ function mode_daycare_eggs()
     end
 end
 
-function mode_roamers()
-    local data
+-- Gen 4 roamers are not encrypted party Pokemon. They are 0x14-byte records:
+--   0x00 location u32
+--   0x04 ivs u32 (HP/Atk/Def/Spe/SpA/SpD, 5 bits each)
+--   0x08 personality u32
+--   0x0C species u16
+--   0x0E current HP u16
+--   0x10 level u8
+--   0x11 status u8
+--   0x12 active u8
+-- TID/SID are not stored, so the override is what decides shininess.
+local ROAMER_GENDER_RATIO = {
+    [144] = 255, -- Articuno
+    [145] = 255, -- Zapdos
+    [146] = 255, -- Moltres
+    [481] = 255, -- Mesprit
+    [488] = 254, -- Cresselia
+    [491] = 255, -- Darkrai
+}
+
+local ROAMER_ABILITY = {
+    [144] = "Pressure",
+    [145] = "Pressure",
+    [146] = "Pressure",
+    [481] = "Levitate",
+    [488] = "Levitate",
+    [491] = "Bad Dreams",
+}
+
+local function roamer_gender(species, pid)
+    local ratio = ROAMER_GENDER_RATIO[species] or 255
+    if ratio == 255 then return "Genderless" end
+    if ratio == 254 then return "Female" end
+    if ratio == 0 then return "Male" end
+    if bit.band(pid, 0xFF) < ratio then return "Female" end
+    return "Male"
+end
+
+local function read_roamer_slot(addr)
+    if not addr or addr < 0x02000000 then
+        return nil
+    end
+
+    local active = mbyte(addr + 0x12)
+    local species = mword(addr + 0x0C)
+    local pid = mdword(addr + 0x08)
+    local level = mbyte(addr + 0x10)
+
+    if active ~= 1 or species == 0 or species > 493 then
+        return nil
+    end
+    if pid == 0 or pid == 0xFFFFFFFF then
+        return nil
+    end
+    if level == 0 or level > 100 then
+        return nil
+    end
+
+    return {
+        addr = addr,
+        species = species,
+        pid = pid,
+        iv32 = mdword(addr + 0x04),
+        level = level,
+        hp = mword(addr + 0x0E),
+    }
+end
+
+local function scan_roamer_slots()
+    local found = {}
+    local slots = pointers.roamer_slots
+    if not slots then
+        return found
+    end
+
+    for _, addr in ipairs(slots) do
+        local slot = read_roamer_slot(addr)
+        if slot then
+            table.insert(found, slot)
+        end
+    end
+
+    return found
+end
+
+local function wanted_roamer_species()
+    local traits = config.target_traits or {}
+    local wanted = {}
+    local any_species = true
+
+    local function add_name(name)
+        if type(name) ~= "string" then
+            return
+        end
+
+        for i = 2, #_DEX do
+            local entry = _DEX[i]
+            if entry and entry[1] and string.lower(entry[1]) == string.lower(name) then
+                wanted[i - 1] = true
+                any_species = false
+            end
+        end
+    end
+
+    if type(traits.name) == "string" then
+        add_name(traits.name)
+    elseif type(traits.name) == "table" then
+        for _, name in pairs(traits.name) do
+            add_name(name)
+        end
+    end
+
+    if type(traits.species) == "number" then
+        wanted[traits.species] = true
+        any_species = false
+    elseif type(traits.species) == "table" then
+        for _, species in pairs(traits.species) do
+            if type(species) == "number" then
+                wanted[species] = true
+                any_species = false
+            end
+        end
+    end
+
+    return wanted, any_species
+end
+
+local function mon_from_roamer(slot, tid, sid)
+    local iv = slot.iv32
+    local mon = {}
+    local dex_entry = _DEX[slot.species + 1]
+
+    mon.species = slot.species
+    mon.pid = string.format("%08X", slot.pid)
+    mon.level = slot.level
+    mon.hpIV = bit.band(iv, 0x1F)
+    mon.attackIV = bit.band(bit.rshift(iv, 5), 0x1F)
+    mon.defenseIV = bit.band(bit.rshift(iv, 10), 0x1F)
+    mon.speedIV = bit.band(bit.rshift(iv, 15), 0x1F)
+    mon.spAttackIV = bit.band(bit.rshift(iv, 20), 0x1F)
+    mon.spDefenseIV = bit.band(bit.rshift(iv, 25), 0x1F)
+    mon.ivSum = mon.hpIV + mon.attackIV + mon.defenseIV + mon.spAttackIV + mon.spDefenseIV + mon.speedIV
+    mon.perfectIVs = 0
+    if mon.hpIV == 31 then mon.perfectIVs = mon.perfectIVs + 1 end
+    if mon.attackIV == 31 then mon.perfectIVs = mon.perfectIVs + 1 end
+    if mon.defenseIV == 31 then mon.perfectIVs = mon.perfectIVs + 1 end
+    if mon.spAttackIV == 31 then mon.perfectIVs = mon.perfectIVs + 1 end
+    if mon.spDefenseIV == 31 then mon.perfectIVs = mon.perfectIVs + 1 end
+    if mon.speedIV == 31 then mon.perfectIVs = mon.perfectIVs + 1 end
+
+    mon.nature = _NATURE[(slot.pid % 25) + 1] or "Unknown"
+    mon.gender = roamer_gender(slot.species, slot.pid)
+    mon.ability = ROAMER_ABILITY[slot.species] or "Unknown"
+    mon.heldItem = "none"
+    mon.isEgg = false
+    mon.altForm = 0
+    mon.name = (dex_entry and dex_entry[1]) or string.format("Species %d", slot.species)
+    mon.type = (dex_entry and dex_entry[2]) or {}
+    mon.nickname = mon.name
+    mon.otID = tid
+    mon.otSID = sid
+    mon.checksum = 0
+    mon.moves = {}
+    mon.raw = {}
+
+    local low = bit.band(slot.pid, 0xFFFF)
+    local high = bit.band(bit.rshift(slot.pid, 16), 0xFFFF)
+    mon.shinyValue = bit.bxor(bit.bxor(bit.bxor(tid, sid), high), low)
+    mon.shiny = mon.shinyValue < 8
+
+    local hpTypeList = {"fighting", "flying", "poison", "ground", "rock", "bug", "ghost", "steel", "fire", "water",
+                        "grass", "electric", "psychic", "ice", "dragon", "dark"}
+    local lsb = (mon.hpIV % 2) + (mon.attackIV % 2) * 2 + (mon.defenseIV % 2) * 4 + (mon.speedIV % 2) * 8 +
+                    (mon.spAttackIV % 2) * 16 + (mon.spDefenseIV % 2) * 32
+    local slsb = bit.rshift(bit.band(mon.hpIV, 2), 1) + bit.rshift(bit.band(mon.attackIV, 2), 1) * 2 +
+                     bit.rshift(bit.band(mon.defenseIV, 2), 1) * 4 + bit.rshift(bit.band(mon.speedIV, 2), 1) * 8 +
+                     bit.rshift(bit.band(mon.spAttackIV, 2), 1) * 16 + bit.rshift(bit.band(mon.spDefenseIV, 2), 1) * 32
+    mon.hpType = hpTypeList[math.floor((lsb * 15) / 63) + 1]
+    mon.hpPower = math.floor((slsb * 40) / 63) + 30
+
+    return mon
+end
+
+local function slot_key(slot)
+    return string.format("%d:%08X", slot.species, slot.pid)
+end
+
+-- Remembers PIDs already judged this session so a save made AFTER the
+-- roamer flew away doesn't soft-reset the same Pokemon forever.
+roamer_seen_pids = roamer_seen_pids or {}
+
+local function should_keep_roamer(mon, wanted, any_species)
+    -- A non-shiny must never be kept. An IV total, nature, or the default
+    -- ivSum rule used to count as a target and skip the reset, which is how
+    -- a normal Cresselia could finish the cutscene and start roaming.
+    if not mon.shiny then
+        return false
+    end
+
+    if not any_species and not wanted[mon.species] then
+        return false
+    end
+
+    if config.always_catch_shinies or config.always_catch_shiny_male_genderless then
+        return true
+    end
+
+    return pokemon.matches_ruleset(mon, config.target_traits)
+end
+
+local function judge_roamers(slots, tid, sid, wanted, any_species, from_baseline)
+    for _, slot in ipairs(slots) do
+        local key = slot_key(slot)
+        local name = (_DEX[slot.species + 1] and _DEX[slot.species + 1][1]) or "Roamer"
+
+        if roamer_seen_pids[key] then
+            abort(name .. " is already roaming on this save, so resetting loads the same Pokemon. Load the save from before it flew away, then start the hunt again.")
+        end
+
+        local mon = mon_from_roamer(slot, tid, sid)
+        print(string.format(
+            "%s | PID %s | SV %d | Shiny %s | %s %s | Lv%d | IVs %d/%d/%d/%d/%d/%d",
+            mon.name, mon.pid, mon.shinyValue, tostring(mon.shiny),
+            mon.nature, mon.gender, mon.level,
+            mon.hpIV, mon.attackIV, mon.defenseIV, mon.spAttackIV, mon.spDefenseIV, mon.speedIV
+        ))
+
+        clear_all_inputs()
+
+        if not should_keep_roamer(mon, wanted, any_species) then
+            if from_baseline then
+                abort(name .. " is already roaming and is not shiny. Load the save from before it flew away, then start the hunt again.")
+            end
+
+            -- Log first, but never let a dashboard error skip the reset.
+            pcall(pokemon.log_encounter, mon)
+            print("Not shiny, resetting before it can roam.")
+            soft_reset()
+            return
+        end
+
+        roamer_seen_pids[key] = true
+        pcall(pokemon.log_encounter, mon)
+        abort(mon.name .. " is a shiny target!")
+    end
+end
+
+local function mode_roamers_from_slots(tid, sid)
+    local wanted, any_species = wanted_roamer_species()
+    local announced = false
+
+    while not game_state.in_game or not pointers.roamer_slots do
+        wait_frames(1)
+    end
+
+    -- Let the save block finish loading before the baseline snapshot.
+    wait_frames(30)
+
+    local baseline = {}
+    local already = {}
+    local present = {}
+    for _, slot in ipairs(scan_roamer_slots()) do
+        baseline[slot_key(slot)] = true
+        present[slot.species] = true
+        if not any_species and wanted[slot.species] then
+            table.insert(already, slot)
+        end
+    end
+
+    -- If every targeted species is already roaming, this save was made after
+    -- they flew away. Judge those records now. If one is still missing, ignore
+    -- roamers that were already active and wait for the new one.
+    local waiting_on_new = any_species
+    if not any_species then
+        for species, _ in pairs(wanted) do
+            if not present[species] then
+                waiting_on_new = true
+                break
+            end
+        end
+    end
+
+    if not waiting_on_new and #already > 0 then
+        judge_roamers(already, tid, sid, wanted, any_species, true)
+        return
+    end
+
     local a_cooldown = 0
-    local is_unencrypted = _ROM.version ~= "PL" -- Only Platinum encrypts roamer data after generating it 
+    while true do
+        -- Read before touching A. The confirming press is what makes her roam,
+        -- so a non-shiny has to be reset on the frame it appears.
+        local fresh = {}
+        for _, slot in ipairs(scan_roamer_slots()) do
+            if not baseline[slot_key(slot)] and (any_species or wanted[slot.species]) then
+                table.insert(fresh, slot)
+            end
+        end
+
+        if #fresh > 0 then
+            clear_all_inputs()
+            judge_roamers(fresh, tid, sid, wanted, any_species, false)
+            return
+        end
+
+        if not announced then
+            if any_species then
+                print("Waiting for a roamer to generate...")
+            else
+                print("Waiting for the target roamer to generate...")
+            end
+            announced = true
+        end
+
+        if a_cooldown == 0 then
+            press_button_async("A")
+            a_cooldown = math.random(4, 12)
+        else
+            a_cooldown = a_cooldown - 1
+        end
+
+        wait_frames(1)
+    end
+end
+
+function mode_roamers()
+    local tid
+    local sid
 
     if not config.ot_override then
-        abort("You must set your TID/SID override before you can start.") -- Prevents mode from beginning if override is not set.
+        abort("You must set your TID/SID override before you can start.")
     end
+
+    tid = tonumber(config.tid_override)
+    sid = tonumber(config.sid_override)
+    if not tid or not sid or tid < 0 or sid < 0 or tid > 65535 or sid > 65535 then
+        abort("TID/SID override must be whole numbers from 0 to 65535.")
+    end
+    tid = bit.band(tid, 0xFFFF)
+    sid = bit.band(sid, 0xFFFF)
+
+    print(string.format("Roamer hunt using TID %d / SID %d", tid, sid))
+
+    -- Diamond, Pearl and Platinum keep roamers in the compact save struct.
+    -- Reading that as a party Pokemon is what crashed pokemon.lua:294.
+    if _ROM.version == "D" or _ROM.version == "P" or _ROM.version == "PL" then
+        mode_roamers_from_slots(tid, sid)
+        return
+    end
+
+    local data
+    local a_cooldown = 0
+    local is_unencrypted = _ROM.version ~= "PL"
 
     while not data do
         data = pokemon.read_data(pointers.roamer, is_unencrypted)
@@ -557,18 +915,21 @@ function mode_roamers()
     end
 
     local mon = pokemon.parse_data(data, true)
-
-    if config.ot_override then
-        mon.otSID = tonumber(config.sid_override) -- SID is not generated during initial encounter. This will prevent false flagging.
-        mon.otID = tonumber(config.sid_override) -- Sets the ID as well for those who are overriding it from their usual TID.
+    if not mon or not mon.name then
+        print_warn("Roamer data could not be parsed, resetting...")
+        soft_reset()
+        return
     end
+
+    mon.otID = tid
+    mon.otSID = sid
 
     local is_target = pokemon.log_encounter(mon)
-    
+
     if mon.name == "Unown" then
-        abort("Please clear the journal and then save to resume.") -- The journal is read as 'Unown'. This will stop pointless resets.
+        abort("Please clear the journal and then save to resume.")
     end
-    
+
     if is_target then
         abort(mon.name .. " is a target!")
     else

@@ -126,17 +126,16 @@ function pokemon.read_data(address, is_raw)
 	checksum_fail_count = checksum_fail_count or 0
 	local CHECKSUM_FAIL_LIMIT = 120
 
-	if checksum_fail_count < CHECKSUM_FAIL_LIMIT then
-		if not verify_checksums(data, checksum) then
-			checksum_fail_count = checksum_fail_count + 1
+	-- Never treat a failed checksum as a real Pokemon. Doing so feeds
+	-- garbage species IDs into the dex lookup and crashes the script.
+	if not verify_checksums(data, checksum) then
+		checksum_fail_count = checksum_fail_count + 1
 
-			if checksum_fail_count == CHECKSUM_FAIL_LIMIT then
-				send_checksum_fail_webhook(checksum_fail_count)
-			end
-
-			return nil
+		if checksum_fail_count == CHECKSUM_FAIL_LIMIT then
+			send_checksum_fail_webhook(checksum_fail_count)
 		end
-	else
+
+		return nil
 	end
 
 	checksum_fail_count = 0
@@ -209,8 +208,15 @@ function pokemon.parse_data(data, enrich)
     local sid = mon.otSID
 
     if config.ot_override then
-        tid = tonumber(config.tid_override)
-        sid = tonumber(config.sid_override)
+        local override_tid = tonumber(config.tid_override)
+        local override_sid = tonumber(config.sid_override)
+
+        -- Roamers (and some statics) are generated before OT IDs are written.
+        -- Only swap in the override when both values are actually numbers.
+        if override_tid and override_sid then
+            tid = bit.band(override_tid, 0xFFFF)
+            sid = bit.band(override_sid, 0xFFFF)
+        end
     end
 
     mon.shinyValue = bit.bxor(bit.bxor(bit.bxor(tid, sid), (bit.band(bit.rshift(mon.pid, 16), 0xFFFF))), bit.band(mon.pid, 0xFFFF))
@@ -291,22 +297,32 @@ function pokemon.parse_data(data, enrich)
     -- Substitute property IDs with ingame names
     if enrich then
         mon.pid = string.format("%08X", mon.pid)
-        mon.name = _DEX[mon.species + 1][1]
-        mon.type = _DEX[mon.species + 1][2]
+
+        -- Species can be out of range when a roamer slot or half-written
+        -- struct is parsed. Indexing a missing dex row is what crashed
+        -- roamers mode ("attempt to index field '?' (a nil value)").
+        local dex_entry = _DEX[mon.species + 1]
+        if dex_entry then
+            mon.name = dex_entry[1]
+            mon.type = dex_entry[2] or {}
+        else
+            mon.name = string.format("Invalid species %d", mon.species)
+            mon.type = {}
+        end
 
         -- mon.rating = pokemon.get_rating(mon)
-        mon.pokeball = _ITEM[mon.pokeball + 1]
-        mon.otLanguage = _LANGUAGE[mon.otLanguage + 1]
-        mon.ability = _ABILITY[mon.ability + 1]
-        mon.nature = _NATURE[mon.nature + 1]
-        mon.heldItem = _ITEM[mon.heldItem + 1]
-        mon.gender = _GENDER[mon.gender + 1]
+        mon.pokeball = _ITEM[mon.pokeball + 1] or "unknown"
+        mon.otLanguage = _LANGUAGE[mon.otLanguage + 1] or "unknown"
+        mon.ability = _ABILITY[mon.ability + 1] or "unknown"
+        mon.nature = _NATURE[mon.nature + 1] or "unknown"
+        mon.heldItem = _ITEM[mon.heldItem + 1] or "unknown"
+        mon.gender = _GENDER[mon.gender + 1] or "unknown"
 
         local move_id = mon.moves
         mon.moves = {}
 
         for _, move in ipairs(move_id) do
-            table.insert(mon.moves, _MOVE[move + 1])
+            table.insert(mon.moves, _MOVE[move + 1] or {name = "Unknown", power = 0})
         end
 
         mon.ivSum = mon.hpIV + mon.attackIV + mon.defenseIV + mon.spAttackIV + mon.spDefenseIV + mon.speedIV
@@ -445,7 +461,7 @@ function pokemon.log_encounter(mon)
         save_target_state(mon)
 		print(mon.name .. " is a target!")
 
-        if config.save_pkx then
+        if config.save_pkx and mon.raw and #mon.raw > 0 then
             local shiny = mon.shiny and " ★" or ""
             local hex_string = string.format("%04X", mon.checksum) .. mon.pid
             local filename =
